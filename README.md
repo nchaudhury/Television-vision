@@ -65,10 +65,14 @@ python run.py --input_dir ./TVPhotos --output_dir ./Output --workers 4
 ### AI compositing (nano-banana-2/edit)
 ```bash
 # Let fal.ai nano-banana-2/edit handle the screen replacement (no geometric warp)
-python run.py --input_dir ./TVPhotos --output_dir ./Output --ai_edit
+# --overlay is required (or defaults to ./Input/input.png) — it is uploaded as the
+# reference image the model uses to fill the TV screen
+python run.py --input_dir ./TVPhotos --output_dir ./Output \
+  --overlay ./Input/input.png --ai_edit
 
 # With a custom prompt
-python run.py --input_dir ./TVPhotos --output_dir ./Output --ai_edit \
+python run.py --input_dir ./TVPhotos --output_dir ./Output \
+  --overlay ./Input/input.png --ai_edit \
   --ai_prompt "Replace the TV screen with the image shown in the second photo, preserving reflections"
 ```
 
