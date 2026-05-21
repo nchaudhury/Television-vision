@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 def refine_corners(
     image: np.ndarray,
     bbox: BoundingBox,
-    padding_ratio: float = 0.1,
+    padding_ratio: float = 0.0,
 ) -> np.ndarray:
     """
     Given a bounding box from Moondream3, find the precise 4 corners of the
@@ -21,6 +21,9 @@ def refine_corners(
     Returns a (4, 2) numpy array of corners in order:
         [top-left, top-right, bottom-right, bottom-left]
     in full-image pixel coordinates.
+
+    The returned quad is guaranteed to stay within the bbox bounds (+ 1% tolerance)
+    so shadow and furniture edges cannot bleed into the compositing area.
     """
     h, w = image.shape[:2]
     px = bbox.to_pixel_coords(w, h)
@@ -36,14 +39,43 @@ def refine_corners(
     if crop.size == 0:
         return _bbox_to_quad(px)
 
+    bbox_quad = _bbox_to_quad(px)
     quad = _find_screen_quad(crop)
 
     if quad is not None:
         quad[:, 0] += x1
         quad[:, 1] += y1
+        quad = _clamp_quad_to_bbox(quad, px)
+        # If the found quad is implausibly larger than the bbox, discard it
+        found_area = _quad_area(quad)
+        bbox_area = _quad_area(bbox_quad)
+        if found_area > bbox_area * 1.15:
+            logger.debug("  Corners: found quad larger than bbox — using bbox rectangle")
+            return bbox_quad
         return quad
 
-    return _bbox_to_quad(px)
+    return bbox_quad
+
+
+def _clamp_quad_to_bbox(quad: np.ndarray, px: dict) -> np.ndarray:
+    """Clamp all quad corners to the bbox bounds + 1% tolerance."""
+    tol_x = (px["x_max"] - px["x_min"]) * 0.01
+    tol_y = (px["y_max"] - px["y_min"]) * 0.01
+    clamped = quad.copy()
+    clamped[:, 0] = np.clip(clamped[:, 0], px["x_min"] - tol_x, px["x_max"] + tol_x)
+    clamped[:, 1] = np.clip(clamped[:, 1], px["y_min"] - tol_y, px["y_max"] + tol_y)
+    return clamped
+
+
+def _quad_area(quad: np.ndarray) -> float:
+    """Approximate area of a quad using the shoelace formula."""
+    n = len(quad)
+    area = 0.0
+    for i in range(n):
+        j = (i + 1) % n
+        area += quad[i][0] * quad[j][1]
+        area -= quad[j][0] * quad[i][1]
+    return abs(area) / 2.0
 
 
 def _bbox_to_quad(px: dict) -> np.ndarray:
@@ -63,13 +95,17 @@ def _find_screen_quad(crop: np.ndarray) -> Optional[np.ndarray]:
     """
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     ch, cw = gray.shape[:2]
-    min_area = ch * cw * 0.15
+    min_area = ch * cw * 0.10  # 10% — more permissive than the old 15%
 
     quad = _try_edge_detection(gray, min_area)
     if quad is not None:
         return quad
 
     quad = _try_adaptive_threshold(gray, min_area)
+    if quad is not None:
+        return quad
+
+    quad = _try_dark_screen(crop, min_area)
     if quad is not None:
         return quad
 
@@ -107,6 +143,20 @@ def _try_adaptive_threshold(gray: np.ndarray, min_area: float) -> Optional[np.nd
     return _best_quad_from_contours(contours, min_area)
 
 
+def _try_dark_screen(crop: np.ndarray, min_area: float) -> Optional[np.ndarray]:
+    """
+    Detect large uniformly dark regions — useful for off (black) TV screens
+    against lighter walls.
+    """
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, dark = cv2.threshold(gray, 55, 255, cv2.THRESH_BINARY_INV)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE, kernel, iterations=3)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel, iterations=1)
+    contours, _ = cv2.findContours(dark, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return _best_quad_from_contours(contours, min_area)
+
+
 def _try_color_segmentation(crop: np.ndarray, min_area: float) -> Optional[np.ndarray]:
     hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
     low_sat = cv2.inRange(hsv, (0, 0, 0), (180, 80, 60))
@@ -119,11 +169,41 @@ def _try_color_segmentation(crop: np.ndarray, min_area: float) -> Optional[np.nd
     return _best_quad_from_contours(contours, min_area)
 
 
+def _corners_from_hull(hull_pts: np.ndarray) -> np.ndarray:
+    """
+    Extract 4 corner-like points from a convex hull by finding the hull vertex
+    that projects furthest in each of the four diagonal directions (TL/TR/BR/BL).
+
+    This naturally handles perspective-distorted screens (trapezoids) because it
+    picks the four most "extreme" vertices rather than fitting an axis-aligned rect.
+    """
+    centroid = hull_pts.mean(axis=0)
+    # Each direction is the unit diagonal toward that corner quadrant
+    dirs = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]  # TL TR BR BL
+    corners = []
+    for dx, dy in dirs:
+        scores = [
+            dx * (p[0] - centroid[0]) + dy * (p[1] - centroid[1])
+            for p in hull_pts
+        ]
+        corners.append(hull_pts[int(np.argmax(scores))])
+    return _order_corners(np.array(corners, dtype=np.float32))
+
+
 def _best_quad_from_contours(
     contours: List,
     min_area: float,
 ) -> Optional[np.ndarray]:
-    """Find the best 4-sided contour that's large enough and roughly rectangular."""
+    """
+    Find the best 4-corner quad from a set of contours.
+
+    Strategy per contour (large enough ones only):
+      1. Try approxPolyDP on the convex hull at progressively coarser epsilon
+         until we get exactly 4 points.
+      2. If no epsilon gives 4 points, fall back to _corners_from_hull which
+         extracts 4 extreme diagonal hull vertices — handles perspective well.
+    Picks the largest-area candidate.
+    """
     candidates = []
 
     for cnt in contours:
@@ -131,27 +211,28 @@ def _best_quad_from_contours(
         if area < min_area:
             continue
 
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
+        hull = cv2.convexHull(cnt)
+        hull_pts = hull.reshape(-1, 2).astype(np.float32)
+        if len(hull_pts) < 4:
+            continue
 
-        if len(approx) == 4:
-            corners = approx.reshape(4, 2).astype(np.float32)
-            corners = _order_corners(corners)
-            if _is_reasonable_quad(corners):
-                candidates.append((area, corners))
-
-    if not candidates:
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < min_area:
-                continue
-            peri = cv2.arcLength(cnt, True)
-            approx = cv2.approxPolyDP(cnt, 0.05 * peri, True)
+        peri = cv2.arcLength(hull, True)
+        found = False
+        for eps_frac in (0.02, 0.03, 0.05, 0.07, 0.10):
+            approx = cv2.approxPolyDP(hull, eps_frac * peri, True)
             if len(approx) == 4:
                 corners = approx.reshape(4, 2).astype(np.float32)
                 corners = _order_corners(corners)
                 if _is_reasonable_quad(corners):
                     candidates.append((area, corners))
+                    found = True
+                    break
+
+        if not found:
+            # Hull didn't simplify to 4 — use diagonal-extreme extraction
+            corners = _corners_from_hull(hull_pts)
+            if _is_reasonable_quad(corners):
+                candidates.append((area, corners))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)

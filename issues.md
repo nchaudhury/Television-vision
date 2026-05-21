@@ -1,206 +1,206 @@
-## 1. ~~Duplicate API Calls~~ ✅ **RESOLVED**
+## 1. ~~Back-of-TV Detections~~ ✅ **RESOLVED**
 
-**Location:** `src/detect.py`
+**Location:** `src/detect.py` — `detect_tvs_full()`; `src/detect_gemini.py` — `_DETECTION_PROMPT`
 
-**Status:** The system now uses a single optimized prompt "television or monitor screen" instead of 3 separate prompts, reducing API calls from 3 to 1 per image.
+**Problem:** Moondream3 sometimes detects the back of a TV or monitor. The overlay was incorrectly pasted onto the TV housing instead of the screen.
+
+**Solution (Moondream3):** A second Moondream3 call is made per TV using the cropped bbox region. If back-panel hardware is detected (`_PROMPT_BACK_OF_TV`) → detection discarded.
+
+**Solution (Gemini):** The detection prompt explicitly excludes rear-facing panels: *"EXCLUDE: the back of a TV or monitor (visible cable ports, HDMI connectors, ventilation slots, power sockets, or any rear-panel hardware facing the viewer)"*. Only front-facing screen surfaces are included.
+
+---
+
+## 2. ~~Shadow-Inclusive Bounding Boxes / Skew~~ ✅ **RESOLVED**
+
+**Location:** `src/detect.py` — Step 2; `src/detect_gemini.py` + SAM2
+
+**Problem:** Axis-aligned bounding boxes included TV shadows and bezels, producing skewed overlays.
+
+**Solution (Moondream3):** Screen refinement call targets screen surface only.
+**Solution (Gemini):** Gemini returns screen-surface bbox; SAM2 then provides pixel-perfect mask → precise perspective-correct quad regardless of tilt or shadow.
+
+---
+
+## 3. ~~Foreground Object Occlusion~~ ✅ **RESOLVED**
+
+**Location:** `src/detect.py` / `src/detect_gemini.py`; `src/composite.py`
+
+**Problem:** Objects placed in front of the TV (figurines, plants, vases) were covered by the overlay.
+
+**Solution:** Gemini (and Moondream3) detect foreground objects. After compositing, original scene pixels are restored within each foreground bbox clipped to the TV mask.
+
+---
+
+## 4. ~~Mirror Reflection Handling~~ ✅ **RESOLVED**
+
+**Location:** `src/detect.py` / `src/detect_gemini.py`; `src/composite.py`
+
+**Problem:** A TV reflected in a mirror received the same overlay as a direct-view TV.
+
+**Solution:** Mirror regions detected. TVs whose bbox center falls inside a mirror → `is_mirror=True`. Compositing applies `cv2.flip(overlay, 1)` for mirror TVs. Gemini handles this in the same detection call at no extra cost.
+
+---
+
+## 5. ~~Moondream3 Artwork/Painting Misdetection~~ ✅ **RESOLVED**
+
+**Location:** `src/detect_gemini.py`
+
+**Problem:** Moondream3 frequently confused rectangular framed paintings, artwork, and decorative pieces with TV screens, producing incorrect composites on non-TV objects. Example: `168_src.jpg` had the overlay placed on a flower painting instead of the actual TV.
+
+**Root cause:** Moondream3 is a small vision model without deep scene-level semantic understanding. It matches geometric shape (dark rectangle with border) rather than understanding what the object is.
+
+**Solution:** Gemini 3.5 Flash (default detector) has deep semantic scene understanding. It explicitly distinguishes flat-panel displays from artwork, paintings, photos, and picture frames. The detection prompt includes explicit exclusion rules.
+
+---
+
+## 6. ~~Missed TV Detections~~ ✅ **RESOLVED**
+
+**Location:** `src/detect_gemini.py`
+
+**Problem:** Moondream3 missed TVs in several failure cases:
+- `102_src.jpg`: large flat-panel TV at right edge of a wide commercial lobby scene
+- `107_src.jpg`: TV above sofa in complex multi-element scene — detected but composite failed
+- `11_src.jpg`: second TV/monitor visible through a doorway in a distant room
+- `20_src.jpg`: side-wall TV at an angle not composited
+
+**Root cause:** Moondream3 struggles with TVs that are small in frame, near image edges, in complex multi-object scenes, or at challenging perspective angles.
+
+**Solution:** Gemini 3.5 Flash has far superior spatial reasoning and handles all of these cases reliably. A single call covers the full scene with rich contextual understanding.
+
+---
+
+## 7. ~~Incorrect Perspective / Wrong Bounding for Angled TVs~~ ✅ **RESOLVED**
+
+**Location:** `src/corners_sam2.py`, `src/detect_gemini.py`
+
+**Problem:** For TVs viewed at an angle (e.g. `21_src.jpg`, `20_src.jpg`), the overlay was placed with incorrect perspective because:
+- Axis-aligned bounding boxes don't capture trapezoid screen shape
+- OpenCV edge detection sometimes found the wrong contour (furniture, wall edges)
+
+**Solution:** SAM2 (`fal-ai/sam2/image`) receives the TV's bounding box as a prompt and returns a pixel-level mask of the exact screen surface. The mask convex hull is simplified to a 4-corner quadrilateral that captures the true perspective shape. `minAreaRect` is used as fallback when approxPolyDP can't simplify cleanly to 4 points. OpenCV corner detection remains as a second-level fallback if SAM2 returns no mask.
+
+---
+
+## 17. ~~Geometric Warp Fails on Glare/Reflective Screens~~ ✅ **RESOLVED** (optional path)
+
+**Location:** `src/composite_ai.py`; `run.py` — `--ai_edit`
+
+**Problem:** The OpenCV perspective warp path relies on accurate 4-corner extraction. On highly reflective screens, screens with severe glare, or frames where SAM2 returns a noisy mask, corner extraction can produce a quad that doesn't precisely match the visible screen boundary. The result is a composited image where the overlay doesn't align naturally with the scene's lighting or reflections.
+
+**Solution:** `--ai_edit` replaces the corner extraction + warp step with a single `fal-ai/nano-banana-2/edit` call. The model receives the scene photo and the overlay image and is prompted to replace the TV screen content. It handles perspective warping, lighting adaptation, and reflection blending internally without explicit corner coordinates.
 
 **Implementation:**
-```python
-prompt = "television or monitor screen"
-```
+- `src/composite_ai.py`: `composite_overlay_ai(scene_path, overlay_path, tv_detections, prompt)`
+  - Auto-builds a location-aware prompt from each TV's normalized bbox center
+  - Uploads both images via `fal_client.upload_file()`
+  - Calls `fal-ai/nano-banana-2/edit` with `image_urls=[scene_url, overlay_url]`
+  - Downloads and decodes result via `httpx` + `cv2.imdecode`
+- `run.py`: `--ai_edit` flag routes compositing to `composite_overlay_ai()` instead of `composite.composite_overlay()`; `--ai_prompt` allows a custom prompt override
+- Detection still runs first (Gemini or Moondream) — used to confirm TVs exist and to build the location prompt
 
-**Impact:**
-- For 100 images: 100 API calls instead of 300
-- 67% reduction in API costs
-- Faster processing time
+**Trade-offs:** Non-deterministic; two extra fal.ai uploads per image; not cached; `--feather`/`--bezel`/`--no_brightness_match` have no effect in AI mode (handled by the model). Output resolution may differ from input.
 
-## 2. ~~No Result Caching~~ ✅ **RESOLVED**
+---
 
-**Location:** `src/cache.py`
+## 8. No Batch API Support
 
-**Status:** Disk-based caching of detection results has been implemented using SHA-256 hash of image files as cache keys.
+**Problem:** API calls are per-image rather than batched.
 
-**Implementation:**
-- Cache stored in `.cache/` directory (gitignored)
-- `get_cached_detections()` returns cached results or None
-- `save_cached_detections()` persists detection results
-- Handles corrupt cache files gracefully
-- Can be disabled with `--no_cache` flag
+**Status:** Gemini detector reduces calls from 4 to 2 per image. True batch API is not currently supported by these endpoints.
 
-**Impact:**
-- Re-runs skip API calls entirely for cached images
-- Faster iteration during development
+---
 
-## 3. ~~Sequential Image Processing~~ ✅ **RESOLVED**
-
-**Location:** `run.py`
-
-**Status:** Parallel processing has been implemented using `ProcessPoolExecutor` with configurable worker count via `--workers` flag.
-
-**Implementation:**
-```python
-with ProcessPoolExecutor(max_workers=args.workers) as executor:
-    futures = [executor.submit(process_image, ...) for img_path in to_process]
-```
-
-**Impact:**
-- CPU-bound operations now utilize multi-core systems
-- Faster overall processing for large batches
-- Configurable parallelism (default: 1, user-specified via `--workers`)
-
-## 4. ~~Redundant Data Transmission~~ ✅ **RESOLVED**
-
-**Location:** `src/detect.py`
-
-**Status:** With the single optimized prompt implementation, the data URI is now sent only once per image instead of 3 times.
-
-**Impact:**
-- 67% reduction in bandwidth usage
-- Faster upload times for large images
-- Eliminated redundant network overhead
-
-## 5. No Batch API Support
-
-**Problem:** The fal.ai API is called per-image rather than supporting batch detection of multiple images in a single request.
-
-**Impact:**
-- Increased HTTP overhead
-- Higher latency
-- More API calls than necessary
-
-**Potential Solutions:**
-- Check if fal.ai supports batch inference
-- Implement local batching with retry logic
-- Use a different model that supports batch processing
-
-## 6. Corner Refinement Strategy Overhead
+## 9. ~~Corner Refinement Strategy Overhead~~ ✅ **RESOLVED** (improved)
 
 **Location:** `src/corners.py`
 
-**Problem:** For each bounding box, corner refinement tries 3 different strategies sequentially (edge detection, adaptive threshold, color segmentation).
+**Previous issue:** OpenCV corner refinement tried 3 strategies sequentially and still sometimes failed for angled or low-contrast screens. The last-resort fallback was a flat axis-aligned bounding box — if SAM2 also failed, perspective-distorted TVs received no perspective warp at all.
 
-```python
-quad = _try_edge_detection(gray, min_area)
-if quad is not None:
-    return quad
+**Resolution (original):** SAM2 segmentation in the Gemini pipeline was intended to replace OpenCV corner detection. OpenCV strategies remain as a graceful fallback when SAM2 returns no mask.
 
-quad = _try_adaptive_threshold(gray, min_area)
-if quad is not None:
-    return quad
+**Resolution (improved — see Issue 16):** Because SAM2 mask decoding was failing silently (Issue 16), the OpenCV fallback was the actual code path for every image. It has been overhauled:
 
-quad = _try_color_segmentation(crop, min_area)
-```
+- **`_corners_from_hull`** (new): Instead of requiring `approxPolyDP` to collapse to exactly 4 points (which fails for perspective-distorted/trapezoidal screens), the function now projects each hull vertex onto the four diagonal directions (TL/TR/BR/BL) and picks the most extreme one per direction. This produces the true geometric corners of a trapezoid, not a rotated rectangle.
+- **`_best_quad_from_contours`** (overhauled): Operates on the convex hull of each contour (not the raw contour), tries 5 epsilon values instead of 2, and falls back to `_corners_from_hull` when `approxPolyDP` never yields 4 points.
+- **`_try_dark_screen`** (new strategy): Thresholds for large uniformly dark regions — targets off (black) TV screens on lighter walls. Inserted as strategy 3 (before `_try_color_segmentation`).
+- **min_area threshold** lowered from 15% to 10% of the crop area.
 
-**Impact:**
-- Additional computation time for each TV
-- Multiple OpenCV operations per detection
-- Potential for redundant processing
+---
 
-**Note:** This is actually a reasonable fallback strategy, but could be optimized.
+## 10. ~~S3 Download Inefficiency~~ ✅ **RESOLVED**
 
-**Potential Solutions:**
-- Use machine learning to predict which strategy will work best
-- Implement early termination with confidence scoring
-- Cache successful strategy per image type/lighting condition
+Parallel downloads via `ThreadPoolExecutor` + `TransferConfig` with multipart downloads.
 
-## 7. ~~S3 Download Inefficiency~~ ✅ **RESOLVED**
+---
 
-**Location:** `src/s3_loader.py`
+## 11. ~~Lack of Progress Persistence~~ ✅ **RESOLVED**
 
-**Status:** S3 downloads now use `ThreadPoolExecutor` with parallel transfers and `TransferConfig` with multipart downloads for large files.
+Checkpointing with `--resume` flag. Progress saved after each image.
 
-**Implementation:**
-```python
-transfer_config = boto3.s3.transfer.TransferConfig(
-    multipart_threshold=8 * 1024 * 1024,
-    max_concurrency=10,
-    multipart_chunksize=8 * 1024 * 1024,
-)
-with ThreadPoolExecutor(max_workers=max_workers) as executor:
-    futures = [executor.submit(_download_one, item) for item in to_download]
-```
+---
 
-**Impact:**
-- Faster download times for many files
-- Utilizes S3's parallel transfer capabilities
-- Optimized for large image files (>8MB multipart threshold)
+## 12. ~~Limited Error Recovery~~ ✅ **RESOLVED**
 
-## 8. ~~Lack of Progress Persistence~~ ✅ **RESOLVED**
+Retry logic with exponential backoff at both API and image-processing levels.
 
-**Location:** `run.py`
+---
 
-**Status:** Checkpointing has been implemented with progress saved after each successfully processed image. Resume capability via `--resume` flag.
+## 13. ~~Duplicate API Calls~~ ✅ **RESOLVED**
 
-**Implementation:**
-- Checkpoint file: `.pipeline_checkpoint.json` in output directory
-- `_load_checkpoint()` loads set of completed filenames
-- `_save_checkpoint()` persists completed filenames
-- `--resume` flag skips already-processed images
+Gemini detector: 1 + N calls per image (vs. 2 + 2N for Moondream3).
 
-**Impact:**
-- Long-running jobs can be resumed after interruption
-- No need to re-process all images from scratch
-- Better user experience for large batches
+---
 
-## 9. No Telemetry or Monitoring
+## 14. ~~Result Caching~~ ✅ **RESOLVED** (extended)
 
-**Problem:** No metrics collection for performance monitoring, API usage tracking, or error rate analysis.
+`cache.py` now exposes both `get/save_cached_detections` (bbox list format, for Moondream3) and `get/save_cached_data` (arbitrary JSON, for Gemini+SAM2). All results cached by `(image_hash, key_slug)`.
 
-**Impact:**
-- Difficult to identify bottlenecks
-- No visibility into API costs
-- Hard to optimize based on real usage data
+---
 
-**Potential Solutions:**
-- Add timing metrics for each stage
-- Track API call counts and costs
-- Log success/error rates
-- Implement structured logging for analysis
+## 15. ~~Gemini 0–1000 Scale Coordinates → TVs Silently Rejected~~ ✅ **RESOLVED**
 
-## 10. ~~Limited Error Recovery~~ ✅ **RESOLVED**
+**Location:** `src/detect_gemini.py` — `_parse_bbox()`
 
-**Location:** `run.py`, `src/detect.py`
+**Problem:** Gemini occasionally returns bounding box coordinates in 0–1000 scale (a known model quirk) instead of the normalized 0–1 range requested by the prompt. After clamping with `min(1.0, x)`, all values collapse to `1.0`, producing a zero-area bbox that is immediately rejected. The log showed "Gemini detected N TV(s)" followed by "0 confirmed TV(s)" with no visible explanation (the rejection was logged at DEBUG level only).
 
-**Status:** Comprehensive retry logic with exponential backoff has been implemented at both API and image-processing levels.
+**Root cause:** Models like Gemini sometimes output integer-grid coordinates as if the image is 1000×1000, ignoring the normalization instruction.
 
-**Implementation:**
-- `process_image()` has retry loop with exponential backoff (max 2 retries)
-- `detect_tvs()` has retry loop with exponential backoff (max 3 retries)
-- Errors are logged with retry attempt information
+**Solution:** Before clamping, `_parse_bbox` now checks if `max(coords) > 1.5`. If so, all four values are divided by 1000 before further processing. The rejection log is also promoted from DEBUG to WARNING and now includes the raw coordinate values.
 
-**Impact:**
-- Automatic recovery from transient failures
-- Higher overall success rate
-- No manual re-run required for temporary issues
+---
 
-## Summary of Optimizations
+## 16. ~~SAM2 Mask Decode Always Fails (Hardcoded Key Lookup)~~ ✅ **RESOLVED**
 
-| Operation | Before | After | Status |
-|-----------|--------|-------|--------|
-| API calls per image | 3 (3 prompts) | 1 (combined prompt) | ✅ Optimized |
-| Result caching | None | Disk-based SHA-256 cache | ✅ Implemented |
-| Image processing | Sequential | Parallel (configurable workers) | ✅ Implemented |
+**Location:** `src/corners_sam2.py` — `_decode_mask()`
+
+**Problem:** `_decode_mask` searched for mask image data under a fixed list of keys (`mask`, `mask_image_url`, `url`, `image_url`). The fal.ai SAM2 API response uses different key nesting than expected, so the mask URL was never found. Every SAM2 call returned a mask object but `_decode_mask` returned `None`, causing `get_sam2_quad` to return `None` and fall through to the OpenCV fallback for 100% of images.
+
+**Root cause:** The fal.ai SAM2 API response schema changed / differed from the hardcoded key list.
+
+**Solution:** `_decode_mask` now uses a recursive traversal (`_collect`) that finds any string value resembling a URL (`http…`) or data-URI (`data:…`) anywhere in the response structure, regardless of key depth or naming. An INFO-level log now prints the top-level mask keys on every call so schema changes are immediately visible in normal (non-verbose) logs.
+
+---
+
+## Summary of All Optimizations
+
+| Issue | Before | After | Status |
+|-------|--------|-------|--------|
+| Artwork misdetected as TV | Moondream3 confuses paintings/frames | Gemini 3.5 Flash semantic understanding | ✅ Fixed |
+| Missed TVs (edge cases) | Moondream3 misses distant/angled/edge TVs | Gemini handles all scene types | ✅ Fixed |
+| Incorrect perspective quad | Axis-aligned bbox + fragile OpenCV | SAM2 pixel mask → precise 4-corner quad | ✅ Fixed |
+| Back-of-TV detection | No filtering | Screen refinement (Moondream3) / semantic (Gemini) | ✅ Fixed |
+| Shadow-inclusive bbox | Bbox includes shadow | SAM2 mask is screen-surface only | ✅ Fixed |
+| Foreground occlusion | Overlay covers foreground objects | Detected foreground bbox → pixel restoration | ✅ Fixed |
+| Mirror reflections | Wrong-direction overlay | Mirror detection + horizontal flip | ✅ Fixed |
+| API calls per image | 2 + 2N (Moondream3) | 1 + N (Gemini) | ✅ Reduced |
+| Result caching | Per (image, prompt) bbox list | + generic JSON cache for Gemini results | ✅ Extended |
+| Image processing | Sequential | Parallel (`--workers`) | ✅ Implemented |
 | S3 downloads | Sequential | Parallel + multipart | ✅ Optimized |
 | Progress persistence | None | Checkpointing + resume | ✅ Implemented |
 | Error recovery | Basic | Retry with exponential backoff | ✅ Enhanced |
-| Corner refinement strategies | Up to 3 per TV | Up to 3 per TV | ⚠️ Could optimize |
-| Telemetry/monitoring | None | None | ⚠️ Not implemented |
-
-## Remaining Optimization Opportunities
-
-**Medium Priority:**
-1. **Corner refinement strategy selection** - Currently tries 3 strategies sequentially. Could add heuristics to predict which strategy will work best for given lighting conditions.
-2. **Telemetry and monitoring** - Add structured metrics collection for performance monitoring, API usage tracking, and error rate analysis to identify bottlenecks.
-
-**Low Priority:**
-3. **Batch API support** - Check if fal.ai supports batch inference for multiple images in a single request to further reduce HTTP overhead.
-4. **Brightness matching caching** - Cache ambient lighting calculations per image to avoid recomputation when multiple TVs are detected in the same scene.
-
-## Completed Optimizations
-
-✅ **Result caching** - Disk-based SHA-256 cache eliminates redundant API calls on re-runs
-✅ **Single prompt detection** - Reduced API calls from 3 to 1 per image via optimized prompting
-✅ **Checkpointing/resume** - Progress persistence enables resuming interrupted long-running jobs
-✅ **Parallel processing** - Configurable worker count via `--workers` flag for multi-core utilization
-✅ **Optimized S3 downloads** - ThreadPoolExecutor with TransferConfig for parallel multipart transfers
-✅ **Enhanced error recovery** - Retry logic with exponential backoff at API and processing levels
+| Detector choice | Moondream3 only | `--detector gemini` (default) or `moondream` | ✅ Implemented |
+| Gemini 0–1000 scale coords silently rejected | Area=0 after clamping → 0 confirmed TVs | Auto-detect scale (max>1.5) → divide by 1000 | ✅ Fixed |
+| SAM2 mask decode always fails | Hardcoded key list missed actual response schema | Recursive URI discovery traverses full response | ✅ Fixed |
+| OpenCV fallback: flat rect for angled TVs | `approxPolyDP` demanded exactly 4 pts; fell back to axis-aligned bbox | `_corners_from_hull` extracts diagonal-extreme vertices; handles trapezoids | ✅ Improved |
+| Glare/reflective screens: poor warp alignment | Geometric warp needs accurate corners; fails on bright/reflective panels | `--ai_edit` uses nano-banana-2/edit; no corner coords needed | ✅ Implemented |
+| Back-of-TV: Gemini had no explicit exclusion rule | Relied on implicit semantic understanding only | Explicit EXCLUDE rule added to `_DETECTION_PROMPT` for rear-panel hardware | ✅ Hardened |

@@ -1,8 +1,11 @@
 import logging
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:
+    from .detect import BoundingBox, TVDetection
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +17,8 @@ def composite_overlay(
     feather_px: int = 5,
     brightness_match: bool = True,
     bezel_pct: float = 0.05,
+    tv_detections: Optional[List] = None,
+    per_tv_bezel: Optional[List[float]] = None,
 ) -> np.ndarray:
     """
     Composite the overlay image onto each TV screen quad in the scene.
@@ -25,8 +30,9 @@ def composite_overlay(
                in [TL, TR, BR, BL] order, pixel coords
         feather_px: Pixels of Gaussian feathering at quad edges
         brightness_match: Adjust overlay brightness to match surroundings
-        bezel_pct: Fraction (0–1) to shrink each edge inward to simulate
-                   a TV bezel. 0.05 = 5% inset on every side.
+        bezel_pct: Default bezel fraction for all TVs
+        tv_detections: Optional list of TVDetection aligned with quads
+        per_tv_bezel: Optional per-TV bezel overrides (aligned with quads)
 
     Returns:
         Composited image (BGR, uint8)
@@ -35,7 +41,15 @@ def composite_overlay(
 
     for i, quad in enumerate(quads):
         logger.debug(f"  Compositing TV #{i + 1}")
-        result = _composite_single(result, overlay, quad, feather_px, brightness_match, bezel_pct)
+        det = tv_detections[i] if tv_detections and i < len(tv_detections) else None
+        is_mirror = det.is_mirror if det else False
+        fg_bboxes = det.foreground_bboxes if det else []
+        this_bezel = per_tv_bezel[i] if per_tv_bezel and i < len(per_tv_bezel) else bezel_pct
+        result = _composite_single(
+            result, overlay, quad, feather_px, brightness_match, this_bezel,
+            is_mirror=is_mirror,
+            foreground_bboxes=fg_bboxes,
+        )
 
     return result
 
@@ -53,6 +67,8 @@ def _composite_single(
     feather_px: int,
     brightness_match: bool,
     bezel_pct: float = 0.05,
+    is_mirror: bool = False,
+    foreground_bboxes: Optional[List] = None,
 ) -> np.ndarray:
     h_scene, w_scene = scene.shape[:2]
     h_ovl, w_ovl = overlay.shape[:2]
@@ -68,7 +84,10 @@ def _composite_single(
 
     M = cv2.getPerspectiveTransform(src_corners, dst_corners)
 
-    adjusted_overlay = overlay.copy()
+    # Flip overlay horizontally for mirror reflections
+    overlay_to_use = cv2.flip(overlay, 1) if is_mirror else overlay
+
+    adjusted_overlay = overlay_to_use.copy()
     if brightness_match:
         adjusted_overlay = _match_brightness(scene, adjusted_overlay, quad)
 
@@ -99,6 +118,27 @@ def _composite_single(
     warped_f = warped.astype(np.float64)
     result = result * (1 - mask_3ch) + warped_f * mask_3ch
     result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # Restore original scene pixels for foreground objects (things in front of TV)
+    if foreground_bboxes:
+        for fb in foreground_bboxes:
+            fx1 = int(fb.x_min * w_scene)
+            fy1 = int(fb.y_min * h_scene)
+            fx2 = int(fb.x_max * w_scene)
+            fy2 = int(fb.y_max * h_scene)
+            # Clamp to image bounds
+            fx1, fy1 = max(0, fx1), max(0, fy1)
+            fx2, fy2 = min(w_scene, fx2), min(h_scene, fy2)
+            if fx2 <= fx1 or fy2 <= fy1:
+                continue
+            # Only restore pixels where the TV mask is active (inside TV region)
+            region_mask = mask[fy1:fy2, fx1:fx2]
+            orig_region = scene[fy1:fy2, fx1:fx2]
+            result_region = result[fy1:fy2, fx1:fx2]
+            # Where mask is set, restore original scene pixels
+            restore = region_mask > 0
+            result_region[restore] = orig_region[restore]
+            result[fy1:fy2, fx1:fx2] = result_region
 
     return result
 
