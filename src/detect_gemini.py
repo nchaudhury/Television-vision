@@ -188,15 +188,17 @@ def _deserialize_detection(d: dict) -> Optional[TVDetection]:
 def detect_tvs_gemini(
     image_path: str,
     use_cache: bool = True,
+    need_quad: bool = True,
 ) -> List[TVDetection]:
     """
     Full detection pipeline using Gemini 3.5 Flash + SAM2.
 
     Step 1: Gemini 3.5 Flash — single call detects all TVs, mirrors, foreground objects.
     Step 2: SAM2 — per-TV box-prompted segmentation to get precise 4-corner quads.
+             Skipped when need_quad=False (e.g. --ai_edit, which never uses det.quad).
 
-    Returns List[TVDetection] with the same interface as detect_tvs_full(), but with
-    det.quad pre-populated (SAM2-derived) so run.py can skip OpenCV corner refinement.
+    Cache reads happen regardless of need_quad. Cache writes only happen when
+    need_quad=True so a no-quad result never poisons the cache for future OpenCV runs.
     """
     # --- Cache check ---
     if use_cache:
@@ -251,26 +253,27 @@ def detect_tvs_gemini(
             if fb is not None
         ]
 
-        # SAM2 quad extraction
+        # SAM2 quad extraction — skipped when caller doesn't need corner coords
         quad = None
-        try:
-            quad = get_sam2_quad(image_path, bbox)
-        except Exception as e:
-            logger.warning(f"  SAM2 failed for TV at ({bbox.x_min:.2f},{bbox.y_min:.2f}): {e}")
+        if need_quad:
+            try:
+                quad = get_sam2_quad(image_path, bbox)
+            except Exception as e:
+                logger.warning(f"  SAM2 failed for TV at ({bbox.x_min:.2f},{bbox.y_min:.2f}): {e}")
 
-        if quad is None:
-            logger.info(
-                f"  SAM2 returned no quad for TV at ({bbox.x_min:.2f},{bbox.y_min:.2f}) "
-                f"— will use OpenCV fallback in run.py"
-            )
-        else:
-            # Clamp SAM2 quad to bbox bounds (1% tolerance)
-            if img is not None:
-                px = bbox.to_pixel_coords(img_w, img_h)
-                tol_x = (px["x_max"] - px["x_min"]) * 0.01
-                tol_y = (px["y_max"] - px["y_min"]) * 0.01
-                quad[:, 0] = np.clip(quad[:, 0], px["x_min"] - tol_x, px["x_max"] + tol_x)
-                quad[:, 1] = np.clip(quad[:, 1], px["y_min"] - tol_y, px["y_max"] + tol_y)
+            if quad is None:
+                logger.info(
+                    f"  SAM2 returned no quad for TV at ({bbox.x_min:.2f},{bbox.y_min:.2f}) "
+                    f"— will use OpenCV fallback in run.py"
+                )
+            else:
+                # Clamp SAM2 quad to bbox bounds (1% tolerance)
+                if img is not None:
+                    px = bbox.to_pixel_coords(img_w, img_h)
+                    tol_x = (px["x_max"] - px["x_min"]) * 0.01
+                    tol_y = (px["y_max"] - px["y_min"]) * 0.01
+                    quad[:, 0] = np.clip(quad[:, 0], px["x_min"] - tol_x, px["x_max"] + tol_x)
+                    quad[:, 1] = np.clip(quad[:, 1], px["y_min"] - tol_y, px["y_max"] + tol_y)
 
         detections.append(TVDetection(
             bbox=bbox,
@@ -280,13 +283,14 @@ def detect_tvs_gemini(
             quad=quad,
         ))
 
+        sam2_status = "skipped" if not need_quad else ("ok" if quad is not None else "fallback")
         logger.info(
             f"  TV: bbox=({bbox.x_min:.3f},{bbox.y_min:.3f})–({bbox.x_max:.3f},{bbox.y_max:.3f}) "
-            f"mirror={is_mirror} fg={len(fg_bboxes)} sam2={'ok' if quad is not None else 'fallback'}"
+            f"mirror={is_mirror} fg={len(fg_bboxes)} sam2={sam2_status}"
         )
 
-    # --- Cache result ---
-    if use_cache:
+    # --- Cache result (only when quads were computed) ---
+    if use_cache and need_quad:
         save_cached_data(
             image_path,
             [_serialize_detection(d) for d in detections],

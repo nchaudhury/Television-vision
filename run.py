@@ -100,7 +100,7 @@ def process_image(
             t0 = time.perf_counter()
             if detector == _DETECTOR_GEMINI:
                 from src.detect_gemini import detect_tvs_gemini
-                tv_detections = detect_tvs_gemini(image_path, use_cache=use_cache)
+                tv_detections = detect_tvs_gemini(image_path, use_cache=use_cache, need_quad=not ai_edit)
             else:
                 tv_detections = detect_tvs_full(image_path, use_cache=use_cache)
             result["timings"]["detect"] = round(time.perf_counter() - t0, 3)
